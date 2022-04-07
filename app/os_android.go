@@ -202,7 +202,7 @@ type ViewEvent struct {
 	// instance backing the Window. The reference is valid until
 	// the next ViewEvent is received.
 	// A zero View means that there is currently no view attached.
-	View uintptr
+	ANativeWindow unsafe.Pointer
 }
 
 type jvalue uint64 // The largest JNI type fits in 64 bits.
@@ -496,7 +496,6 @@ func Java_org_gioui_GioView_onCreateView(env *C.JNIEnv, class C.jclass, view C.j
 	w.Configure(wopts.options)
 	w.SetInputHint(key.HintAny)
 	w.setStage(system.StagePaused)
-	w.callbacks.Event(ViewEvent{View: uintptr(view)})
 	return C.jlong(w.handle)
 }
 
@@ -533,6 +532,7 @@ func Java_org_gioui_GioView_onSurfaceDestroyed(env *C.JNIEnv, class C.jclass, ha
 func Java_org_gioui_GioView_onSurfaceChanged(env *C.JNIEnv, class C.jclass, handle C.jlong, surf C.jobject) {
 	w := cgo.Handle(handle).Value().(*window)
 	w.win = C.ANativeWindow_fromSurface(env, surf)
+	w.callbacks.Event(ViewEvent{ANativeWindow: unsafe.Pointer(w.win)})
 	if w.started {
 		w.setVisible(env)
 	}

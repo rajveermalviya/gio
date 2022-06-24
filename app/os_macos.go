@@ -106,7 +106,7 @@ static void setWindowStyleMask(CFTypeRef windowRef, NSWindowStyleMask mask) {
 
 static void closeWindow(CFTypeRef windowRef) {
 	NSWindow* window = (__bridge NSWindow *)windowRef;
-	[window performClose:nil];
+	[window close];
 }
 
 static void setSize(CFTypeRef windowRef, CGFloat width, CGFloat height) {

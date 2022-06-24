@@ -8,6 +8,20 @@
 
 __attribute__ ((visibility ("hidden"))) CALayer *gio_layerFactory(void);
 
+@interface GioWindow : NSWindow {}
+@end
+
+@implementation GioWindow
+- (BOOL)canBecomeKeyWindow {
+	// Defaults to NO for NSWindowStyleMaskBorderless windows.
+	return YES;
+}
+
+- (BOOL)canBecomeMainWindow {
+	return YES;
+}
+@end
+
 @interface GioAppDelegate : NSObject<NSApplicationDelegate>
 @end
 
@@ -343,7 +357,7 @@ CFTypeRef gio_createWindow(CFTypeRef viewRef, CGFloat width, CGFloat height, CGF
 			NSMiniaturizableWindowMask |
 			NSClosableWindowMask;
 
-		NSWindow* window = [[NSWindow alloc] initWithContentRect:rect
+		GioWindow* window = [[GioWindow alloc] initWithContentRect:rect
 													   styleMask:styleMask
 														 backing:NSBackingStoreBuffered
 														   defer:NO];

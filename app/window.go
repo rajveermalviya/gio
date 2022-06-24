@@ -25,7 +25,6 @@ import (
 	"gioui.org/io/system"
 	"gioui.org/layout"
 	"gioui.org/op"
-	"gioui.org/op/clip"
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
@@ -55,17 +54,16 @@ type Window struct {
 	immediateRedraws chan struct{}
 	// scheduledRedraws is sent the most recent delayed redraw time.
 	scheduledRedraws chan time.Time
+	// options are the options waiting to be applied.
+	options chan []Option
+	// actions are the actions waiting to be performed.
+	actions chan system.Action
 
 	out      chan event.Event
 	frames   chan *op.Ops
 	frameAck chan struct{}
-	closing  bool
 	// dead is closed when the window is destroyed.
 	dead chan struct{}
-	// options are the options waiting to be applied.
-	options []Option
-	// actions are the actions waiting to be performed.
-	actions system.Action
 
 	stage        system.Stage
 	animating    bool
@@ -80,6 +78,11 @@ type Window struct {
 	cursor      pointer.Cursor
 	decorations struct {
 		op.Ops
+		// enabled tracks the Decorated option as
+		// given to the Option method. It may differ
+		// from Config.Decorated depending on platform
+		// capability.
+		enabled bool
 		Config
 		*material.Theme
 		*widget.Decorations
@@ -139,6 +142,7 @@ func NewWindow(options ...Option) *Window {
 	defaultOptions := []Option{
 		Size(800, 600),
 		Title("Gio"),
+		Decorated(true),
 	}
 	options = append(defaultOptions, options...)
 	var cnf Config
@@ -155,8 +159,11 @@ func NewWindow(options ...Option) *Window {
 		wakeups:          make(chan struct{}, 1),
 		wakeupFuncs:      make(chan func()),
 		dead:             make(chan struct{}),
+		options:          make(chan []Option, 1),
+		actions:          make(chan system.Action, 1),
 		nocontext:        cnf.CustomRenderer,
 	}
+	w.decorations.enabled = cnf.Decorated
 	w.imeState.compose = key.Range{Start: -1, End: -1}
 	w.semantic.ids = make(map[router.SemanticID]router.SemanticNode)
 	w.callbacks.w = w
@@ -334,8 +341,18 @@ func (w *Window) Invalidate() {
 
 // Option applies the options to the window.
 func (w *Window) Option(opts ...Option) {
-	w.options = append(w.options, opts...)
-	w.wakeup()
+	if len(opts) == 0 {
+		return
+	}
+	for {
+		select {
+		case old := <-w.options:
+			opts = append(old, opts...)
+		case w.options <- opts:
+			w.wakeup()
+			return
+		}
+	}
 }
 
 // ReadClipboard initiates a read of the clipboard in the form
@@ -446,20 +463,10 @@ func (c *callbacks) Event(e event.Event) bool {
 		c.waitEvents = c.waitEvents[:len(c.waitEvents)-1]
 		handled = c.w.processEvent(c.d, e)
 	}
-	if _, iswakeup := e.(wakeupEvent); iswakeup {
-		if len(c.w.options) > 0 {
-			c.d.Configure(c.w.options)
-			c.w.options = nil
-		}
-		if c.w.actions != 0 {
-			c.d.Perform(c.w.actions)
-			c.w.actions = 0
-		}
-	}
-	c.w.updateState(c.d)
-	if c.w.closing {
-		c.w.closing = false
-		c.d.Close()
+	select {
+	case <-c.w.dead:
+	default:
+		c.w.updateState(c.d)
 	}
 	return handled
 }
@@ -818,18 +825,22 @@ func (w *Window) processEvent(d driver, e event.Event) bool {
 			w.queue.q.RevealFocus(viewport)
 		}
 		w.viewport = viewport
-		size := e2.Size // save the initial window size as the decorations will change it.
-		e2.FrameEvent.Size = w.decorate(d, e2.FrameEvent, wrapper)
+		viewSize := e2.Size
+		m := op.Record(wrapper)
+		size, offset := w.decorate(d, e2.FrameEvent, wrapper)
+		e2.FrameEvent.Size = size
+		deco := m.Stop()
 		w.out <- e2.FrameEvent
 		frame := w.waitFrame(d)
 		var signal chan<- struct{}
 		if frame != nil {
 			signal = w.frameAck
-			cl := clip.Rect{Max: e2.FrameEvent.Size}.Push(wrapper)
+			off := op.Offset(offset).Push(wrapper)
 			ops.AddCall(&wrapper.Internal, &frame.Internal, ops.PC{}, ops.PCFor(&frame.Internal))
-			cl.Pop()
+			off.Pop()
 		}
-		err := w.validateAndProcess(d, size, e2.Sync, wrapper, signal)
+		deco.Add(wrapper)
+		err := w.validateAndProcess(d, viewSize, e2.Sync, wrapper, signal)
 		if err != nil {
 			w.destroyGPU()
 			w.out <- system.DestroyEvent{Err: err}
@@ -848,6 +859,26 @@ func (w *Window) processEvent(d driver, e event.Event) bool {
 		w.out <- e2
 		w.waitAck(d)
 	case wakeupEvent:
+		select {
+		case opts := <-w.options:
+			// Send a decoration mode update, in case the driver does not
+			// support switching.
+			cnf := Config{Decorated: w.decorations.enabled}
+			for _, opt := range opts {
+				opt(w.metric, &cnf)
+			}
+			if w.decorations.enabled != cnf.Decorated {
+				w.decorations.enabled = cnf.Decorated
+				w.out <- ConfigEvent{Config: w.effectiveConfig()}
+			}
+			d.Configure(opts)
+		default:
+		}
+		select {
+		case acts := <-w.actions:
+			d.Perform(acts)
+		default:
+		}
 	case ConfigEvent:
 		w.decorations.Config = e2.Config
 		if !w.fallbackDecorate() {
@@ -855,7 +886,7 @@ func (w *Window) processEvent(d driver, e event.Event) bool {
 			w.decorations.Decorations = nil
 			w.decorations.size = image.Point{}
 		}
-		e2.Config.Size = e2.Config.Size.Sub(w.decorations.size)
+		e2.Config = w.effectiveConfig()
 		w.out <- e2
 	case event.Event:
 		handled := w.queue.q.Queue(e2)
@@ -938,13 +969,13 @@ func (w *Window) updateCursor(d driver) {
 
 func (w *Window) fallbackDecorate() bool {
 	cnf := w.decorations.Config
-	return !cnf.Decorated && cnf.Mode != Fullscreen && !w.nocontext
+	return w.decorations.enabled && !cnf.Decorated && cnf.Mode != Fullscreen && !w.nocontext
 }
 
 // decorate the window if enabled and returns the corresponding Insets.
-func (w *Window) decorate(d driver, e system.FrameEvent, o *op.Ops) image.Point {
+func (w *Window) decorate(d driver, e system.FrameEvent, o *op.Ops) (size, offset image.Point) {
 	if !w.fallbackDecorate() {
-		return e.Size
+		return e.Size, image.Pt(0, 0)
 	}
 	theme := w.decorations.Theme
 	if theme == nil {
@@ -989,16 +1020,20 @@ func (w *Window) decorate(d driver, e system.FrameEvent, o *op.Ops) image.Point 
 	// Update the window based on the actions on the decorations.
 	w.Perform(deco.Actions())
 	// Offset to place the frame content below the decorations.
-	size := image.Point{Y: dims.Size.Y}
-	op.Offset(image.Pt(0, size.Y)).Add(o)
-	appSize := e.Size.Sub(size)
-	if w.decorations.size != size {
-		w.decorations.size = size
-		cnf := w.decorations.Config
-		cnf.Size = appSize
-		w.out <- ConfigEvent{Config: cnf}
+	decoSize := image.Point{Y: dims.Size.Y}
+	appSize := e.Size.Sub(decoSize)
+	if w.decorations.size != decoSize {
+		w.decorations.size = decoSize
+		w.out <- ConfigEvent{Config: w.effectiveConfig()}
 	}
-	return appSize
+	return appSize, image.Pt(0, decoSize.Y)
+}
+
+func (w *Window) effectiveConfig() Config {
+	cnf := w.decorations.Config
+	cnf.Size = cnf.Size.Sub(w.decorations.size)
+	cnf.Decorated = w.decorations.enabled || cnf.Decorated
+	return cnf
 }
 
 // Perform the actions on the window.
@@ -1006,20 +1041,28 @@ func (w *Window) Perform(actions system.Action) {
 	walkActions(actions, func(action system.Action) {
 		switch action {
 		case system.ActionMinimize:
-			w.options = append(w.options, Minimized.Option())
+			w.Option(Minimized.Option())
 		case system.ActionMaximize:
-			w.options = append(w.options, Maximized.Option())
+			w.Option(Maximized.Option())
 		case system.ActionUnmaximize:
-			w.options = append(w.options, Windowed.Option())
-		case system.ActionClose:
-			w.closing = true
+			w.Option(Windowed.Option())
 		default:
 			return
 		}
 		actions &^= action
 	})
-	w.actions = w.actions | actions
-	w.wakeup()
+	if actions == 0 {
+		return
+	}
+	for {
+		select {
+		case old := <-w.actions:
+			actions |= old
+		case w.actions <- actions:
+			w.wakeup()
+			return
+		}
+	}
 }
 
 func (q *queue) Events(k event.Tag) []event.Event {

@@ -98,9 +98,15 @@ static NSWindowStyleMask getWindowStyleMask(CFTypeRef windowRef) {
 	return [window styleMask];
 }
 
+static void setWindowStyleMask(CFTypeRef windowRef, NSWindowStyleMask mask) {
+	NSWindow *window = (__bridge NSWindow *)windowRef;
+	window.styleMask = mask;
+	[window invalidateShadow];
+}
+
 static void closeWindow(CFTypeRef windowRef) {
 	NSWindow* window = (__bridge NSWindow *)windowRef;
-	[window performClose:nil];
+	[window close];
 }
 
 static void setSize(CFTypeRef windowRef, CGFloat width, CGFloat height) {
@@ -269,11 +275,12 @@ func (w *window) WriteClipboard(s string) {
 
 func (w *window) updateWindowMode() {
 	style := int(C.getWindowStyleMask(w.window))
-	if style&C.NSWindowStyleMaskFullScreen > 0 {
+	if style&C.NSWindowStyleMaskFullScreen != 0 {
 		w.config.Mode = Fullscreen
 	} else {
 		w.config.Mode = Windowed
 	}
+	w.config.Decorated = style&C.NSWindowStyleMaskTitled != 0
 }
 
 func (w *window) Configure(options []Option) {
@@ -283,8 +290,6 @@ func (w *window) Configure(options []Option) {
 	w.updateWindowMode()
 	cnf := w.config
 	cnf.apply(cfg, options)
-	// Decorations are never disabled.
-	cnf.Decorated = true
 
 	switch cnf.Mode {
 	case Fullscreen:
@@ -347,6 +352,14 @@ func (w *window) Configure(options []Option) {
 	}
 	if cnf.Decorated != prev.Decorated {
 		w.config.Decorated = cnf.Decorated
+		mask := C.getWindowStyleMask(w.window)
+		style := C.NSWindowStyleMask(C.NSWindowStyleMaskTitled | C.NSWindowStyleMaskResizable | C.NSWindowStyleMaskMiniaturizable | C.NSWindowStyleMaskClosable)
+		if cnf.Decorated {
+			mask |= style
+		} else {
+			mask &^= style
+		}
+		C.setWindowStyleMask(w.window, mask)
 	}
 	if w.config != prev {
 		w.w.Event(ConfigEvent{Config: w.config})
@@ -375,6 +388,9 @@ func (w *window) Perform(acts system.Action) {
 			C.raiseWindow(w.window)
 		}
 	})
+	if acts&system.ActionClose != 0 {
+		C.closeWindow(w.window)
+	}
 }
 
 func (w *window) SetCursor(cursor pointer.Cursor) {
@@ -411,10 +427,6 @@ func (w *window) runOnMain(f func()) {
 			f()
 		}
 	})
-}
-
-func (w *window) Close() {
-	C.closeWindow(w.window)
 }
 
 func (w *window) setStage(stage system.Stage) {
@@ -783,6 +795,7 @@ func newWindow(win *callbacks, options []Option) error {
 		errch <- nil
 		w.w = win
 		w.window = C.gio_createWindow(w.view, 0, 0, 0, 0, 0, 0)
+		w.updateWindowMode()
 		win.SetDriver(w)
 		w.Configure(options)
 		if nextTopLeft.x == 0 && nextTopLeft.y == 0 {
